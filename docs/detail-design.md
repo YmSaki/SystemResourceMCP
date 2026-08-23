@@ -1,10 +1,10 @@
 # 詳細設計書 — SystemResourceMCP
 
-> このドキュメントは、`basic-spec.md`（rev.2）の**基本仕様**を、コードに落とせる粒度の**詳細設計**へ展開したものである。
+> このドキュメントは、`basic-spec.md`（rev.3）の**基本仕様**を、コードに落とせる粒度の**詳細設計**へ展開したものである。
 > 主に `basic-spec.md §15` が実装フェーズ手前で詰めるとした事項を確定させる。
 > 各設計判断には、対応する基本仕様の節（`basic-spec.md §x`）を添える。
 >
-> - 日付: 2026-08-23（rev.2 の基本仕様から再導出）
+> - 日付: 2026-08-23（rev.3 の基本仕様から再導出）
 > - フェーズ: **詳細設計**（前フェーズ＝基本仕様／次フェーズ＝実装）
 > - フェーズ体系: 要求 → 要件定義 → 基本仕様 → **詳細設計** → 実装
 > - 上位文書: `docs/basic-spec.md`（さらに上位に `reqire.md` / `hearing.md`）
@@ -12,11 +12,11 @@
 ### 本書と上位仕様の関係（改訂の原則）
 
 本書は詳細設計であり、**基本仕様で確定した規範値を変更しない**（`basic-spec.md` 冒頭原則）。
-初版（rev.1）のレビューで、基本仕様側に実装時に一意解決できない矛盾・技術的に成立しない前提が見つかったため、詳細設計で握りつぶさず**基本仕様を1段差し戻して再確定**（`basic-spec.md` rev.2 差し戻し改訂履歴）した。本書はその改訂後の基本仕様から再導出したものである。
+2回のレビューで基本仕様側に矛盾・不成立前提が見つかったため、詳細設計で握りつぶさず**基本仕様を差し戻して再確定**（`basic-spec.md` rev.2／rev.3 差し戻し改訂履歴）し、本書はその改訂後の基本仕様から再導出している。
 
-本 rev.2 で解消した初版の不備:
+初版（rev.1）レビューで解消した不備:
 
-| 出所 | 初版の不備 | 解消 |
+| 出所 | 不備 | 解消 |
 | --- | --- | --- |
 | 基本仕様差し戻し | 設定 `window < interval` の矛盾 | 実効ウィンドウ=`max`（§4） |
 | 基本仕様差し戻し | `PhysicalID` 集約が Win/mac で不成立 | OS別トポロジAPI＋フォールバック（§5.3） |
@@ -26,6 +26,19 @@
 | 詳細設計 | 使用率を全engine合算→100clamp | 最ビジーエンジン値（§5.5） |
 | 詳細設計 | gopsutil 初回CPUは error でサンプルを落とす | 初回は CPU=N/A の部分サンプルを保存（§5.3, §10） |
 | 詳細設計 | MCP SDK 版を実装へ先送り | v1.6.1 に確定（§9.1） |
+
+rev.2 レビューで解消した不備（本 rev.3）:
+
+| 出所 | 不備 | 解消 |
+| --- | --- | --- |
+| 新契約（要件） | 取得手段が無い項目の扱いが未契約 | FR-7.1 を要件へ追加し、本書で反映（§5.4, §5.5） |
+| 基本仕様差し戻し | `nvidia-smi` 不在時 Windows NVIDIA が列挙すら消える（FR-3衝突） | 条件付きソース選択（在→nvidia-smi／不在→DXGI+PDH・CUDAのみN/A）（§5.4, §5.5） |
+| 基本仕様差し戻し | `CPUPerSocket` 取得不能を `[overall]` とし2ソケット機を誤表示 | 取得不能は**空配列**（§5.3） |
+| 詳細設計 | PDH を1サンプルで読む（rate系は2サンプル要） | PDH クエリを状態保持し baseline＋周期collect（§5.5） |
+| 詳細設計 | engine 集約キーが `engtype`（物理エンジン非一意） | キーを `(LUID, phys, eng)` に（§5.5） |
+| 詳細設計 | `mcp.AddTool` が擬似APIで、trend の `content` が JSON になる | 実API `mcp.AddTool` ＋ trend は `content` に英語本文を明示（§9.2） |
+| 詳細設計 | 回帰の関数が timestamp を受けない | `computeStats([]point{T,V})` で時刻に対する回帰（§7.2） |
+| 詳細設計（要確認） | macOS の logical→socket API が不確実 | best-effort 明記、不能時 `perSocket=[]`（§5.3） |
 
 ---
 
@@ -213,9 +226,9 @@ type collector struct {
 
 `Collect()` は CPU→メモリ→GPU の順に測り、個々の失敗は当該フィールドを nil にして継続。GPU 全滅で `GPUs` は空配列（`basic-spec.md §7.5`）。errors.Join で部分失敗を束ねて返すが、`Sample` は常に返す。
 
-### 5.3 CPU・メモリ（`cpu.go` / `mem.go`）— rev.2
+### 5.3 CPU・メモリ（`cpu.go` / `mem.go`）— rev.3
 
-`basic-spec.md §7.2` rev.2。使用率は gopsutil、ソケットトポロジは OS 別 API に分離する。
+`basic-spec.md §7.2` rev.3。使用率は gopsutil、ソケットトポロジは OS 別 API に分離する。
 
 ```go
 // collect は全体使用率と、ソケット別使用率を返す。
@@ -227,16 +240,18 @@ func (c *cpuCollector) collect() (overall *float64, perSocket []float64, err err
 手順:
 1. `overall`: `cpu.Percent(0, false)` の `[0]`。error（初回など）なら `overall=nil`。
 2. `perCore`: `cpu.Percent(0, true)`（論理コア別）。
-3. `perSocket`: OS別トポロジ `logicalToSocket()`（下記）で論理コアをソケットへ束ね、ソケット番号昇順に平均。**トポロジ取得不能または overall のみ得られた場合は `perSocket = [overall]`（overall が nil なら空配列）にフォールバック**（`basic-spec.md §7.2`, FR-7）。
+3. `perSocket`: OS別トポロジ `logicalToSocket()`（下記）で論理コアをソケットへ束ね、ソケット番号昇順に平均。**トポロジが取得できない場合は `perSocket = []`（空配列＝ソケット別内訳は取得不能）にフォールバック**（`basic-spec.md §7.2` rev.3, FR-7/FR-7.1）。rev.2 の `[overall]` は 2ソケット機を1ソケットに誤表示するため誤り。トポロジが「1ソケット」と判明した単一ソケット機のみ `perSocket = [overall]`（1要素）になる（これは取得不能ではなく正しい単一ソケット値）。
 
 ```go
 // logicalToSocket は論理コア index → ソケット番号 の対応を返す。ビルドタグで実体が変わる。
 //   windows: GetLogicalProcessorInformationEx(RelationProcessorPackage)（x/sys/windows）
 //   linux:   /proc/cpuinfo の physical id
-//   darwin:  sysctl（hw.packages 等）
-// 取得不能なら (nil, false)。
+//   darwin:  （下記の注意。確実な logical→package API が乏しく best-effort）
+// 取得不能なら (nil, false) → 呼び出し側で perSocket=[]（FR-7.1）。
 func logicalToSocket() (mapping []int, ok bool)
 ```
+
+**macOS の注意（要実装時確認）**: `sysctl` の `hw.packages` / `hw.physicalcpu` 等は**個数・能力情報**であり、論理CPU index → package の対応を直接は返さない。したがって macOS で `logicalToSocket` を確実に構築できるかは実装前に検証を要する。構築できない場合は `(nil, false)` を返し `perSocket=[]` にフォールバックする（FR-7.1 により、取得手段が無ければ N/A で許容）。実運用上、Apple Silicon は単一パッケージであり `perSocket=[overall]`（1要素）で足り、マルチソケットは旧 Intel Mac Pro に限られるため、当面 macOS は「単一パッケージ＝[overall]、判別不能＝[]」で扱う。
 
 ```go
 // メモリ: mem.VirtualMemory() の Used/Total/UsedPercent を格納。used_percent もここで確定。
@@ -245,24 +260,38 @@ func (c memCollector) collect() (sample.Memory, error)
 
 初回 CPU が error でも、`Collect()` は `CPU.OverallPercent=nil`（＝N/A）の部分サンプルを返し、`main` はそれを Store に入れる（起動直後の即時応答を空にしない。`basic-spec.md §6.2, FR-9`。初版 finding #8 対策）。2サンプル目以降は基準が揃い値が入る。
 
-### 5.4 GPU：ソース単一化と OS 振り分け（rev.2）
+### 5.4 GPU：条件付きソース選択と OS 振り分け（rev.3）
 
-`basic-spec.md §7.3` rev.2 の**ソース単一化**を実装する。1つのGPUの全項目は単一ソースから揃え、異種ソース間の突合はしない。
+`basic-spec.md §7.3` rev.3 の**条件付きソース選択**を実装する。1つのGPUの全項目は常に単一ソースから揃え、異種ソース間の突合はしない。ソースは起動時プローブ（§5.8）の `nvidia-smi` 有無で決める（`basic-spec.md §7.3` rev.3, FR-7.1）。
 
 ```go
 type gpuCollector interface {
-    probe(logger *slog.Logger)            // 起動時の能力判定（§5.8）
-    collect() ([]sample.GPUSample, error) // ソースごとに完結した GPUSample を結合して返す
+    probe(logger *slog.Logger)            // nvidia-smi 有無等を判定（§5.8）
+    collect() ([]sample.GPUSample, error) // 条件付きソースで完結した GPUSample を結合して返す
 }
 ```
 
-| ファイル | ビルドタグ | NVIDIA | 非NVIDIA |
-| --- | --- | --- | --- |
-| `gpu_windows.go` | `windows` | `nvidia-smi` で完結（§5.4.1） | DXGI 列挙（NVIDIA除外）＋ PDH メトリクス（§5.5） |
-| `gpu_linux.go` | `linux` | `nvidia-smi` で完結 | sysfs 列挙＋AMD=`rocm-smi`/sysfs |
-| `gpu_darwin.go` | `darwin` | — | `system_profiler` 列挙のみ（§5.6） |
+| ファイル | ビルドタグ | `nvidia-smi` 在 | `nvidia-smi` 不在 | 非NVIDIA |
+| --- | --- | --- | --- | --- |
+| `gpu_windows.go` | `windows` | NVIDIA=`nvidia-smi` 完結、**DXGIはNVIDIA除外**（§5.4.1） | NVIDIA=**DXGI＋PDH**（列挙・使用率・VRAM取得、**CUDA=nil**）、DXGIはNVIDIA除外しない | DXGI 列挙＋PDH（§5.5） |
+| `gpu_linux.go` | `linux` | NVIDIA=`nvidia-smi` 完結 | NVIDIA=sysfs列挙のみ（使用率/VRAM/CUDA=nil、FR-7.1） | sysfs 列挙＋AMD=`rocm-smi`/sysfs |
+| `gpu_darwin.go` | `darwin` | — | — | `system_profiler` 列挙のみ（§5.6） |
 
-`collect()` は、NVIDIA 群（`nvidia-smi` 由来）と 非NVIDIA 群（OS由来）を**それぞれ独立に**構築し、最後に結合する。結合後に表示用 `Index` を 0 から連番で振る（§8.1 の表示にのみ使用。同定は `StableID`）。
+`collect()` は次の擬似ロジックで構築する（`basic-spec.md §7.3` rev.3）。
+
+```
+nvSmiAvail := probe 結果
+if nvSmiAvail:
+    nvGPUs  := parseNvidiaSmiXML(...)         // NVIDIA、全項目
+    others  := enumerateDXGINonNVIDIA()+PDH   // 非NVIDIA のみ（VendorId 0x10DE 除外）
+else (Windows):
+    others  := enumerateDXGIAll()+PDH         // NVIDIA も含めて DXGI+PDH（CUDA=nil）
+    nvGPUs  := []                             // nvidia-smi 由来は無し
+result := append(nvGPUs, others...)           // どのGPUも単一ソース由来。突合なし
+```
+
+結合後に表示用 `Index` を 0 から連番で振る（§8.1 の表示にのみ使用。同定は `StableID`）。
+`nvidia-smi` 不在時に NVIDIA を DXGI+PDH で扱っても、`nvidia-smi` 由来が空なので二重計上は起きず、識別は DXGI の LUID で一貫する（§5.7）。
 
 #### 5.4.1 `nvidia-smi` XML → `GPUSample`（全項目・全OS共通）
 
@@ -286,34 +315,51 @@ func parseNvidiaSmiXML(xmlBytes []byte) ([]sample.GPUSample, error) // golden XM
 
 `nvidia-smi` 不在（プローブ）なら NVIDIA 群は空。
 
-### 5.5 Windows 非NVIDIA 層（DXGI 列挙 ＋ PDH メトリクス）— rev.2
+### 5.5 Windows DXGI 列挙 ＋ PDH メトリクス層 — rev.3
 
-`basic-spec.md §7.4` rev.2。`golang.org/x/sys/windows` から cgo なしで呼ぶ。
+`basic-spec.md §7.4` rev.3。`golang.org/x/sys/windows` から cgo なしで呼ぶ。この層は非NVIDIA を常に、加えて **`nvidia-smi` 不在時は NVIDIA も**扱う（§5.4）。
 
 **列挙・VRAM総量・LUID・ベンダー（DXGI）**
 1. `CreateDXGIFactory1` → `IDXGIFactory1`（COM vtbl を `syscall.SyscallN` で呼ぶ）。
 2. `EnumAdapters1` を 0 から `DXGI_ERROR_NOT_FOUND` まで。各 `GetDesc1` で `DXGI_ADAPTER_DESC1` を取得。
-3. `Description`→`Name`、`DedicatedVideoMemory`→`VRAMTotalBytes`、`AdapterLuid`→`OSAdapterID`（`"%d:%d"` 表記）、`VendorId`→`Vendor`（0x1002=AMD, 0x8086=Intel, 0x106B=Apple, その他=Unknown）。
-4. **`VendorId == 0x10DE`（NVIDIA）は除外**（`nvidia-smi` に一本化。二重計上回避。`basic-spec.md §7.3` rev.2）。
+3. `Description`→`Name`、`DedicatedVideoMemory`→`VRAMTotalBytes`、`AdapterLuid`→`OSAdapterID`（`"%d:%d"` 表記）、`VendorId`→`Vendor`（0x10DE=NVIDIA, 0x1002=AMD, 0x8086=Intel, 0x106B=Apple, その他=Unknown）。
+4. **NVIDIA（`VendorId == 0x10DE`）の除外は条件付き**（rev.3）: `nvidia-smi` が在れば除外（`enumerateDXGINonNVIDIA`）、無ければ除外しない（`enumerateDXGIAll`）。§5.4 のソース選択に従う。
 5. ソフトウェアアダプタ（`DXGI_ADAPTER_FLAG_SOFTWARE`）は除外。
-6. `PCIBusID` は DXGI から**得られない**ため nil のまま（`OSAdapterID`=LUID を識別に使う）。
+6. `PCIBusID` は DXGI から**得られない**ため nil のまま（`OSAdapterID`=LUID を識別に使う）。NVIDIA を DXGI 経路で扱う場合も CUDA は nil（取得手段が無い。FR-7.1）。
 
-**使用率（PDH `GPU Engine`）— 最ビジーエンジン方式（finding #6 対策）**
-1. `PdhOpenQuery` → `PdhAddEnglishCounter(\GPU Engine(*)\Utilization Percentage)`（English 版でロケール非依存）。
-2. `PdhCollectQueryData` → `PdhGetFormattedCounterArray(PDH_FMT_DOUBLE)`。
-3. インスタンス名 `pid_<pid>_luid_0x0_0x<LUID>_phys_<p>_eng_<n>_engtype_<type>` から `luid` と `engtype`（＋phys）を抽出。
-4. 集約: 同一 `luid` について、**各物理エンジン（engtype/phys）ごとにプロセス横断で合算**し、**エンジン間では最大値**を採る。すなわち `adapterUtil = max_engine( sum_pid(util) )`。全engine合算や100clampはしない（`basic-spec.md §7.4` rev.2）。
-5. `luid`→`UtilPercent` を、DXGI 列挙の `OSAdapterID`(LUID) と突き合わせる（同一ソース＝Windows OS層内の突合。§5.7）。
+**PDH のサンプルライフサイクル（finding: PDH は2サンプル必要）**
+PDH の rate/timer 系カウンタは、formatted value を得るのに**前回値と現在値の2サンプル**が必要である（初回 `PdhCollectQueryData` は基準値のみ）。そこで **PDH クエリをコレクタの状態として保持**する。
+
+```
+probe/init 時:
+    h := PdhOpenQuery()
+    PdhAddEnglishCounter(h, `\GPU Engine(*)\Utilization Percentage`)   // English版でロケール非依存
+    PdhAddEnglishCounter(h, `\GPU Adapter Memory(*)\Dedicated Usage`)
+    PdhCollectQueryData(h)          // baseline（1回目）。値はまだ読まない
+各 sampling tick（周期ごと）:
+    PdhCollectQueryData(h)          // 2回目以降
+    arr := PdhGetFormattedCounterArray(h, PDH_FMT_DOUBLE)
+```
+
+`windowsGPU` は `pdhQuery` ハンドルを保持し、`collect()` ごとに collect→format する。初回 tick は差がまだ整わない項目がありうるため N/A になりうる（FR-7/FR-9 と整合）。
+
+**使用率（PDH `GPU Engine`）— 最ビジーエンジン方式（finding #6 ＋ engine key 修正）**
+1. 上記クエリの `GPU Engine` インスタンス配列を得る。
+2. インスタンス名 `pid_<pid>_luid_0x0_0x<LUID>_phys_<p>_eng_<n>_engtype_<type>` から `LUID`・`phys`・`eng`（参考に `engtype`）を抽出。
+3. 集約: **物理エンジンの識別キーは `(LUID, phys, eng)`**。`engtype` は分類ラベルであって識別子ではなく、同一 `engtype` に別 `eng` が複数ありうるため単独では物理エンジンを一意化できない。同一 `(LUID, phys, eng)` をプロセス横断で合算し、**同一 `LUID` 内ではエンジン間で最大値**を採る。すなわち `adapterUtil = max_{(phys,eng)}( sum_pid(util) )`。全エンジン合算や 100 clamp はしない（`basic-spec.md §7.4`）。
+4. `LUID`→`UtilPercent` を、DXGI 列挙の `OSAdapterID`(LUID) と突き合わせる（同一ソース内の突合。§5.7）。
 
 **VRAM 使用量（PDH `GPU Adapter Memory`）— システム全体（finding #5 対策）**
 - `\GPU Adapter Memory(luid_...)\Dedicated Usage` を LUID ごとに読み、`VRAMUsedBytes` に入れる（システム全体の専用メモリ使用量）。
-- **`IDXGIAdapter3::QueryVideoMemoryInfo().CurrentUsage` は呼び出しプロセス自身の使用量**のため VRAM 使用量には使わない（`basic-spec.md §7.4` rev.2）。
+- **`IDXGIAdapter3::QueryVideoMemoryInfo().CurrentUsage` は呼び出しプロセス自身の使用量**のため VRAM 使用量には使わない（`basic-spec.md §7.4`）。
 
 ```go
-func (g *windowsGPU) probe(logger *slog.Logger)          // DXGI factory / PDH クエリの可否
-func enumerateDXGINonNVIDIA() ([]sample.GPUSample, error) // 名前/総量/LUID/Vendor（NVIDIA除外）
-func queryUtilByLUID() (map[string]float64, error)        // GPU Engine 集約（max-engine）
-func queryVRAMUsedByLUID() (map[string]uint64, error)     // GPU Adapter Memory Dedicated Usage
+type windowsGPU struct { pdhQuery pdhHandle; nvSmiAvail bool /* ... */ }
+func (g *windowsGPU) probe(logger *slog.Logger)          // DXGI factory・PDH クエリ生成＋baseline collect・nvidia-smi 有無
+func enumerateDXGINonNVIDIA() ([]sample.GPUSample, error) // NVIDIA 除外（nvidia-smi 在時）
+func enumerateDXGIAll() ([]sample.GPUSample, error)       // NVIDIA 含む（nvidia-smi 不在時、CUDA=nil）
+func (g *windowsGPU) queryUtilByLUID() (map[string]float64, error) // (LUID,phys,eng) 集約→max-engine
+func (g *windowsGPU) queryVRAMUsedByLUID() (map[string]uint64, error)
 ```
 
 いずれも Win32 API で cgo なし（`basic-spec.md §12.2 NFR-4`）。使えない環境（カウンタ無効等）はプローブで検出し当該項目を N/A（`basic-spec.md §11`）。
@@ -332,7 +378,7 @@ func queryVRAMUsedByLUID() (map[string]uint64, error)     // GPU Adapter Memory 
 
 ### 5.7 `StableID` 導出（ソース内一意）
 
-`basic-spec.md §4.4` rev.2。`StableID` は**同一ソース内で**GPUを一意に指す。
+`basic-spec.md §4.4` rev.3。`StableID` は**同一ソース内で**GPUを一意に指す。
 
 ```go
 func deriveStableID(g sample.GPUSample) string {
@@ -346,10 +392,11 @@ func deriveStableID(g sample.GPUSample) string {
 }
 ```
 
-**突合はソースをまたがない**（`basic-spec.md §7.3` rev.2）。
-- NVIDIA: `nvidia-smi` の1回の出力で全項目が揃うので突合自体が不要。
-- Windows 非NVIDIA: DXGI 列挙（LUID付き）と PDH メトリクス（LUID キー）を **LUID で突合**。両者とも Windows OS 層という同一ソースなのでキーが一致する。
-これにより、初版の「DXGI(LUID) と nvidia-smi(UUID) が一致せず index+name に落ちて同型GPU誤結合」が構造的に起こらない。
+**突合はソースをまたがない**（`basic-spec.md §7.3` rev.3）。
+- NVIDIA（`nvidia-smi` 在）: `nvidia-smi` の1回の出力で全項目が揃うので突合自体が不要（`StableID` は uuid/pci）。
+- NVIDIA（`nvidia-smi` 不在, Windows）: DXGI+PDH 側で扱われ、非NVIDIA と同じく **LUID で突合**（`StableID` は luid、CUDA=nil）。`nvidia-smi` 由来が無いので DXGI 側と競合しない。
+- 非NVIDIA（Windows）: DXGI 列挙（LUID付き）と PDH メトリクス（LUID キー）を **LUID で突合**。同一ソースなのでキーが一致する。
+これにより、rev.1 の「DXGI(LUID) と nvidia-smi(UUID) が一致せず index+name に落ちて同型GPU誤結合」が構造的に起こらない。1つのGPUは常にどちらか一方のソースからのみ現れる。
 
 ### 5.8 能力プローブ
 
@@ -416,18 +463,28 @@ const (
 type seriesKind int
 const ( kindPercent seriesKind = iota; kindQuantity )
 
+type point struct{ T time.Time; V float64 } // 時刻付き測定値（basic-spec §8.2「時刻に対する回帰」）
 type stats struct{ mean, std, min, max, first, last, slope float64; n int }
-func computeStats(values []float64) stats // null除外、n<2 は slope=0（basic-spec §8.1）
+
+// computeStats は非nil値のみを時刻付きで受け、統計量を出す（basic-spec §8.1）。
+// slope は「時刻に対する」最小二乗回帰の傾き。n<2 は slope=0。
+// 値だけの []float64 にすると、null を除いた際に実時間間隔が失われ回帰が歪む
+// （例: t=0,10,20 で t=10 が N/A のとき [v0,v2] を等間隔とみなすのは誤り）。
+// そのため時刻を保持したまま回帰する。
+func computeStats(points []point) stats
+
+// 各系列は非nil値のみを (Timestamp, value) の point として抽出する。
+func series(samples []sample.Sample, pick func(sample.Sample) *float64) []point
 
 type levelVerdict struct{ steady bool; mean float64 }
 type dirVerdict   struct{ kind dirKind; start, end float64 }
 type peakVerdict  struct{ kind peakKind; max float64 }
 func judgeLevel(s stats) levelVerdict
 func judgeDirection(s stats, k seriesKind) dirVerdict
-func judgePeak(values []float64, s stats, k seriesKind) peakVerdict
+func judgePeak(points []point, s stats, k seriesKind) peakVerdict
 ```
 
-判定式は `basic-spec.md §8.3` の表そのまま。使用率系は pt、量的系列は平均比。決定性は入力統計量のみに依存（`basic-spec.md §8.4`）。
+判定式は `basic-spec.md §8.3` の表そのまま。使用率系は pt、量的系列は平均比。決定性は入力統計量のみに依存（`basic-spec.md §8.4`）。回帰は各 `point.T`（実時刻）に対して行う。
 
 ### 7.3 分析
 
@@ -516,23 +573,34 @@ func NewServer(st *store.Store, cfg config.Config, logger *slog.Logger) *Server
 func (s *Server) Run(ctx context.Context) error // STDIO・ブロッキング。ctx キャンセルで終了
 ```
 
-登録（採用版 API に整合させる擬似コード）:
+登録は **v1.6.1 の実 API `mcp.AddTool[In, Out]`**（typed handler）を使う。ハンドラは `(*mcp.CallToolResult, Out, error)` を返し、`Out` が `structuredContent` になる。
+
+**重要（finding: content の自動生成と仕様の衝突）**: v1.6.1 の `mcp.AddTool` は、ハンドラが `CallToolResult.Content` を指定しないと、`structuredContent` を**JSON 化して `TextContent` に自動挿入**する。
+- `get_current_resources`: `content` は「スナップショットの JSON 直列化」でよい（`basic-spec.md §6.2` と一致）ので、自動生成に任せる（`CallToolResult` は nil でよい）。
+- `get_resource_trend`: `content` は**英語レポート本文そのもの**でなければならない（`basic-spec.md §6.3`）。自動生成に任せると JSON（`{"report":...}`）が `content` になってしまうため、**明示的に `TextContent{Text: out.Report}` を返す**。
 
 ```go
-// get_current_resources: 引数なし。最新サンプルを ResourceSnapshot で返す。
-server.AddTool("get_current_resources", withOutputSchema[ResourceSnapshot](),
-    func(ctx, _ struct{}) (ResourceSnapshot, error) { return st.Latest(), nil })
+// get_current_resources: content は JSON 自動生成に任せる（§6.2 と一致）
+mcp.AddTool(server,
+    &mcp.Tool{Name: "get_current_resources", Description: "..."},
+    func(ctx context.Context, req *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, ResourceSnapshot, error) {
+        return nil, st.Latest(), nil // Content 未指定 → structured を JSON 化して TextContent 自動挿入
+    })
 
-// get_resource_trend: 引数なし。直近（実効）ウィンドウの傾向。
-server.AddTool("get_resource_trend", withOutputSchema[TrendReport](),
-    func(ctx, _ struct{}) (TrendReport, error) {
+// get_resource_trend: content は英語本文を明示（§6.3。JSONにさせない）
+mcp.AddTool(server,
+    &mcp.Tool{Name: "get_resource_trend", Description: "..."},
+    func(ctx context.Context, req *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, TrendReport, error) {
         samples := st.Snapshot(cfg.Window)
         needed := int(math.Ceil(float64(cfg.Window) / float64(cfg.SamplingInterval)))
-        return trend.BuildReport(trend.Analyze(samples), cfg.Window, len(samples), needed), nil
+        out := trend.BuildReport(trend.Analyze(samples), cfg.Window, len(samples), needed)
+        res := &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: out.Report}}}
+        return res, out, nil // structuredContent=out、content=英語本文
     })
 ```
 
-`structuredContent` は上記戻り値、後方互換 `content` は SDK が自動生成しなければハンドラで JSON 直列化（snapshot）／本文（`report`）を添える（`basic-spec.md §6.2, §6.3`）。`search_processes` は登録しない（MVP外、`basic-spec.md §6.4`）。
+入力引数なしは空 struct（`struct{}`）で表す。`outputSchema` は `AddTool` が `Out` 型（`ResourceSnapshot` / `TrendReport`）から生成する。`search_processes` は登録しない（MVP外、`basic-spec.md §6.4`）。
+（`mcp.AddTool` / `mcp.CallToolResult` / `mcp.TextContent` は v1.6.1 の実型名。細部シグネチャは採用タグで最終確認する。）
 
 ---
 
@@ -605,16 +673,17 @@ func sampler(ctx context.Context, coll collector.Collector, st *store.Store, int
 
 ---
 
-## 13. トレーサビリティ（基本仕様 rev.2 → 詳細設計）
+## 13. トレーサビリティ（基本仕様 rev.3 → 詳細設計）
 
-| 基本仕様（rev.2） | 本書での確定箇所 |
+| 基本仕様（rev.3） | 本書での確定箇所 |
 | --- | --- |
 | §4 データモデル／§6.2 公開スキーマ | §5.1（公開スキーマに一致する型） |
 | §4.4 GPU 識別子（ソース内一意） | §5.7 |
 | §5.3 設定（実効ウィンドウ=max） | §4.3 |
 | §6 リングバッファ | §6 |
-| §7.2 CPU（gopsutil＋OSトポロジ） | §5.3 |
-| §7.3–§7.4 GPU（ソース単一化・PDH max-engine・Adapter Memory） | §5.4〜§5.7 |
+| §7.2 CPU（gopsutil＋OSトポロジ・取得不能は空配列） | §5.3 |
+| §7.3–§7.4 GPU（条件付きソース選択・PDH max-engine・Adapter Memory） | §5.4〜§5.7 |
+| FR-7.1（取得手段が無い項目は N/A 許容） | §5.3, §5.4, §5.5 |
 | §8 傾向判定（規範値） | §7 |
 | §9 自然言語生成 | §8 |
 | §6 MCP スキーマ | §9（SDK v1.6.1・登録・structuredContent） |

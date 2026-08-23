@@ -22,6 +22,10 @@
   - **§5.3 設定検証**: `window ≥ interval` を検証条件（不成立でフォールバック）とする規則は、`interval` が既定超（例120秒）かつ `window` 未指定/不正のとき `window(60) < interval(120)` を解消できず矛盾した。**実効ウィンドウ = `max(window, interval)`** に改める（常に最低1サンプルを保証）。
   - **§7.2 マルチソケットCPU**: 「論理コア使用率を gopsutil の `PhysicalID` で束ねる」は、gopsutil の Windows/macOS 実装で論理コアと `PhysicalID` が対応せず成立しない。**使用率取得＝gopsutil／論理→ソケット対応＝OS別トポロジAPI**へ手段を分離し、取得不能時は `per_socket=[overall]` にフォールバックする。
   - **§7.3–§7.4 Windows GPU 識別**: DXGI/DXCore は PCI バスIDを返さない（LUID のみ）ため、`nvidia-smi`（UUID/PCI）との層間 `StableID` 突合が一致せず同型GPU誤結合の恐れがあった。**ソースを単一化**し、NVIDIA は `nvidia-smi` で完結、DXGI 列挙は NVIDIA を除外（非NVIDIAのみ）することで、層間キー突合そのものを不要にする。あわせて VRAM 使用量は per-process の `QueryVideoMemoryInfo` ではなくシステム全体を表す `GPU Adapter Memory` カウンタから、使用率は全エンジン合算ではなく**最もビジーなエンジンの値**から得る、と手段を正す。
+- **2026-08-23（rev.3）**: rev.2 の再レビューで見つかった、基本仕様内の 2 件の矛盾／反映漏れと、新しい契約（`reqire.md` FR-7.1）を反映した。要件（要求・要件定義）への差し戻しは不要だが、依頼者要求により FR-7.1（取得手段が無い項目は N/A 許容）を要件へ追加している。
+  - **§7.3–§7.4, §11 NVIDIA ソース選択を条件付き化**: rev.2 は「NVIDIA を常に DXGI から除外」としたため、`nvidia-smi` 不在の Windows で NVIDIA GPU が列挙すらされず FR-3（全列挙）と衝突していた（§11 の記述とも矛盾）。**`nvidia-smi` が在れば nvidia-smi で完結（DXGI は NVIDIA 除外）、無ければ DXGI＋PDH で列挙・使用率・VRAM を取得し CUDA のみ N/A**（FR-7.1）に改める。単一ソース原則は維持（常にどちらか一方から揃う）。
+  - **§7.2 `CPUPerSocket` フォールバックを空配列に**: rev.2 はトポロジ取得不能時 `[CPUOverall]`（要素1個）にフォールバックしたが、2ソケット機を1ソケットに誤表示する。データモデル §4.1 の「取得不能時＝空配列」に合わせ、**取得不能時は `[]`** とする（FR-7.1）。
+  - **§13 テスト方針の反映漏れ修正**: rev.1 の「`window < interval` でデフォルトへ落ちる」記述を rev.2 の実効ウィンドウ=`max` に合わせて修正。
 
 ---
 
@@ -440,8 +444,9 @@ CPU 使用率は、直前の測定との差分から算出される性質を持�
   - macOS: `sysctl`（`hw.packages` / `hw.physicalcpu` 等）。
 
 得たトポロジで論理コア使用率をソケットへ束ね、ソケットごとに平均して `CPUPerSocket`（ソケット番号昇順）を作る。
-**トポロジが取得できない場合は劣化継続とし、`CPUPerSocket = [CPUOverall]`（要素1個＝全体値）にフォールバックする**（FR-7）。物理CPUが1つの一般的な環境でも同様に1要素になり、全体値と一致する。
-この「取れないときは単一要素で全体値」という最小挙動により、FR-3（マルチソケット対応）を満たしつつ、トポロジAPIが使えない環境でもクラッシュしない。
+**トポロジが取得できない場合は `CPUPerSocket = []`（空配列＝ソケット別内訳は取得不能）にフォールバックする**（FR-7, FR-7.1、データモデル §4.1 の「取得不能時＝空配列」と一致）。rev.2 では `[CPUOverall]`（要素1個）にフォールバックする案だったが、これは誤りである。2ソケット機でトポロジ取得に失敗したとき `[52.0]` を返すと「1ソケットで52%」に見えてしまい、実際の「ソケット別は取得不能」を偽って表す。取得手段（トポロジAPI）が無いなら N/A（空配列）が正しい（FR-7.1）。
+物理CPUが1つの環境は「トポロジが1ソケットと判明した」ケースであり、`CPUPerSocket` は要素1個（＝全体値）になる（これは取得不能ではなく、正しい単一ソケット値）。
+この扱いにより、FR-3（マルチソケット対応）を満たしつつ、トポロジAPIが使えない環境でもクラッシュせず、かつ内訳不能を偽らない。
 
 メモリは、使用量と総容量（`MemUsedBytes` / `MemTotalBytes`）を取得する（FR-3）。
 
@@ -454,18 +459,21 @@ GPU は OS とベンダーで取得手段が分かれ、しかも macOS(Apple Si
 **ソース単一化の原則（rev.2）。**
 1つのGPUの全項目（識別子・名前・使用率・VRAM・CUDA）は、**単一のソースから揃える**。異種ソース間で同一GPUを突き合わせる設計は採らない。
 理由は、Windows で DXGI/DXCore が PCI バスIDを返さない（得られる識別子は LUID・ベンダーID・デバイスID・VRAM総量・機種名まで）一方、`nvidia-smi` は UUID/PCI を返すため、両者の `StableID` は導出元が異なり突き合わせられないからである。旧 rev.1 は両ソースを `StableID` で突合する前提だったが、キーが一致せず最終手段（index+name）に落ちて同型GPU誤結合を招く。
-そこで役割を次のように単一化する。
+そこで役割を次のように単一化する。ただし**ソースの選択は取得手段の有無に応じて条件付き**とする（rev.3、FR-7.1「取得手段が無い項目だけ N/A」）。
 
-- **NVIDIA GPU**: `nvidia-smi` だけで完結させる（列挙も使用率もVRAMもCUDAも識別子も、すべて `nvidia-smi` から）。
-- **非NVIDIA GPU（AMD/Intel、Windows）**: DXGI 列挙 ＋ PDH メトリクス（§7.4）で完結させる。**DXGI 列挙は NVIDIA（VendorId `0x10DE`）を除外**し、`nvidia-smi` の結果と二重計上しない。
-- **Linux / macOS**: 従来どおり（Linux は sysfs 列挙＋NVIDIA=`nvidia-smi`／AMD=`rocm-smi`、macOS は `system_profiler` 列挙のみ）。
+- **NVIDIA GPU（Windows/Linux、`nvidia-smi` が在るとき）**: `nvidia-smi` だけで完結させる（列挙も使用率もVRAMもCUDAも識別子も、すべて `nvidia-smi` から）。このとき **DXGI 列挙は NVIDIA（VendorId `0x10DE`）を除外**し、二重計上を避ける。
+- **NVIDIA GPU（Windows、`nvidia-smi` が無いとき）**: **DXGI＋PDH で扱う**（列挙・使用率・VRAM は取得。**CUDA は取得手段が無いので N/A**）。この場合、DXGI 列挙は NVIDIA を除外しない（`nvidia-smi` が結果を出さないため二重計上は起きない）。これにより `nvidia-smi` の無い Windows でも NVIDIA GPU が列挙され、FR-3 の全列挙を満たす（rev.2 の「NVIDIA を常に DXGI から除外」は、`nvidia-smi` 不在時に NVIDIA が列挙すらされず FR-3 と衝突したため、条件付きに改めた）。
+- **非NVIDIA GPU（AMD/Intel、Windows）**: DXGI 列挙 ＋ PDH メトリクス（§7.4）で完結させる。
+- **Linux / macOS**: Linux は sysfs 列挙＋NVIDIA=`nvidia-smi`（在れば）／AMD=`rocm-smi`（在れば）。`nvidia-smi` が無ければ NVIDIA は sysfs 列挙のみで使用率・VRAM・CUDA は N/A（FR-7.1）。macOS は `system_profiler` 列挙のみ。
+
+いずれの場合も、**1つのGPUは常に単一ソースから揃う**（`nvidia-smi` 由来か DXGI+PDH 由来かのどちらか一方）ため、異種ソース間の突合は発生しない。ソース選択は起動時の能力プローブ（§7.1）で `nvidia-smi` の有無を判定して決める。
 
 **列挙層**は、搭載GPUをすべて数え上げ、機種名・ベンダー・識別子（§4.4）を得る。
 使用率や VRAM が取れないベンダー・OS でも、少なくとも「何が挿さっているか」を返せるようにするのが狙いである（FR-3 の「全列挙」「内蔵GPU含む」）。
 
 | OS | 列挙手段 | 得られる識別子 | 備考 |
 | --- | --- | --- | --- |
-| Windows（非NVIDIA） | DXGI/DXCore（機種名・VRAM総量・LUID・ベンダーID。内蔵GPUも列挙） | `OSAdapterID`(LUID)（PCIバスIDは**取得不可**） | NVIDIA は除外 |
+| Windows（非NVIDIA、及び nvidia-smi 不在時の NVIDIA） | DXGI/DXCore（機種名・VRAM総量・LUID・ベンダーID。内蔵GPUも列挙） | `OSAdapterID`(LUID)（PCIバスIDは**取得不可**） | NVIDIA は `nvidia-smi` 在時のみ除外 |
 | Windows（NVIDIA） | `nvidia-smi` | `UUID`, `PCIBusID` | 列挙もメトリクスも単一ソース |
 | Linux | sysfs（`/sys/class/drm`）＋ PCI ID 解決、補助的に `lspci` | `PCIBusID` | NVIDIA/AMD はベンダー拡張で上乗せ |
 | macOS | `system_profiler SPDisplaysDataType -json` | （限定的） | 使用率・VRAM は N/A |
@@ -489,7 +497,7 @@ Windows の PDH と DXGI は Windows システムコール（`golang.org/x/sys/w
 
 **NVIDIA** は、**`nvidia-smi` のサブプロセス呼び出しだけで完結**する（列挙・使用率・VRAM・CUDA・識別子のすべて。rev.2 のソース単一化）。
 XML 出力（`nvidia-smi -q -x`）を解釈し、GPU ごとの UUID・PCIバスID・使用率・VRAM使用量・VRAM総量・機種名・CUDAバージョンを一度に得る。
-UUID/PCIバスIDが `nvidia-smi` 内で揃うため、識別が安定する（§4.4）。Windows でも NVIDIA はこの単一ソースで扱い、DXGI 列挙からは除外する（二重計上と、LUID↔PCI の橋渡し不能問題を回避）。
+UUID/PCIバスIDが `nvidia-smi` 内で揃うため、識別が安定する（§4.4）。`nvidia-smi` が在るときは Windows でも NVIDIA をこの単一ソースで扱い、DXGI 列挙からは除外する（二重計上と、LUID↔PCI の橋渡し不能問題を回避）。`nvidia-smi` が無い Windows では NVIDIA を DXGI＋PDH 側で扱い（CUDA のみ N/A）、DXGI 列挙から除外しない（§7.3 の条件付きソース選択）。
 
 NVML（`go-nvml`）ではなく `nvidia-smi` を選ぶのは、単一バイナリ方針（NFR-4）を守るためである。
 NVML の直接利用は cgo と共有ライブラリのリンクを要し、`CGO_ENABLED=0` のクロスコンパイルを妨げる。
@@ -665,7 +673,8 @@ GPU が複数枚あるときは、枚ごとに `GPU 0 ...`、`GPU 1 ...` と列�
 | 事象 | 扱い |
 | --- | --- |
 | GPU非搭載 | `GPUs` 空配列。CPU／メモリは通常どおり |
-| `nvidia-smi` 不在 | NVIDIA ベンダー拡張を N/A。Windowsでは共通層で使用率・VRAM を取得、他OSでは列挙層で機種名のみ |
+| `nvidia-smi` 不在（Windows） | NVIDIA を DXGI＋PDH で扱う（列挙・使用率・VRAM は取得、CUDA のみ N/A）。この場合に限り DXGI 列挙は NVIDIA を除外しない（§7.3 の条件付きソース選択） |
+| `nvidia-smi` 不在（Linux） | NVIDIA は sysfs で列挙（機種名）、使用率・VRAM・CUDA は取得手段が無ければ N/A（FR-7.1） |
 | Windows パフォーマンスカウンタ利用不可 | 使用率・VRAM を N/A、列挙層で機種名のみ |
 | 権限不足 | 取得できた項目のみ返し、不能項目は N/A |
 | 同型GPUで安定識別子が取れない | index+name で突合し、不安定である旨を標準エラーに記録 |
@@ -713,7 +722,7 @@ GPU が複数枚あるときは、枚ごとに `GPU 0 ...`、`GPU 1 ...` と列�
 - **傾向分析・文生成**：固定のサンプル列を入力に、期待する英語文が一意に出ることをテーブル駆動で検証する。3系統（水準／変化／極値）それぞれの成立・不成立、データ不足時の分岐を網羅する。
 - **構造化出力**：`get_current_resources`／`get_resource_trend` の応答が `outputSchema`（`ResourceSnapshot`／`TrendReport`）に適合し、`structuredContent` と後方互換 `content` が整合することを検証する。
 - **GPU 識別子突合**：同型GPU複数枚を模した列挙層・メトリクス層の入力に対し、`StableID` により正しく結合されること、安定識別子欠如時に index+name へフォールバックすることを検証する。
-- **設定ローダ**：ファイル欠如、不正値、境界値（ウィンドウ＜周期）でデフォルトに落ちることを検証する。
+- **設定ローダ（rev.2/3）**：ファイル欠如・不正値で該当項目が既定へ落ちること、及び `window < interval`（例 `interval=120`＋`window`未指定/30）のとき**実効ウィンドウ = `max(window, interval)` = 120** に引き上げられ、最低1サンプルを保証すること（rev.1 の「デフォルトへ落ちる」ではない）を検証する。
 - **GPU 解釈**：`nvidia-smi -q -x` の XML、`system_profiler` の JSON、Windows カウンタ／DXGI の取得結果など、実環境で採取した出力をゴールデンファイルとして固定し、解釈結果を検証する。これによりGPU実機なしでも解釈ロジックを回帰テストできる。
 - **劣化継続**：採取器が失敗を返す模擬環境で、スナップショットが N/A を含みつつ他項目を返し、プロセスが落ちないことを検証する。
 - **軽量性（NFR-1）**：アイドル環境で監視プロセスの CPU／RSS を既定設定のまま計測し、§12.1 の規範値を満たすことを確認する。
