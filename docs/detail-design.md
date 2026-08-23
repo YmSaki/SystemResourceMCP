@@ -560,7 +560,7 @@ type TrendReport struct {
 }
 ```
 
-順序は水準→向き/変動→極値（`basic-spec.md §9.1`）。先頭 `Over the last {window}s:`。
+順序は水準→向き/変動→極値（`basic-spec.md §9.1`）。先頭 `Over the last {window} seconds:`（`basic-spec.md §6.3` の凍結例 `Over the last 60 seconds:` と一致。旧稿の `{window}s:` は §6.3 と不一致だったため実装フェーズ整合チェックで修正）。
 `needed` は**実効ウィンドウ**基準 `ceil(window/interval)`（§4）。`sampleCount < needed` で `DataComplete=false`、冒頭に不足文（`basic-spec.md §9.3`）。
 
 ---
