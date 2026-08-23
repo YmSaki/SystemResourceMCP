@@ -484,7 +484,7 @@ func computeStats(points []point) stats
 // 各系列は非nil値のみを (Timestamp, value) の point として抽出する。
 func series(samples []sample.Sample, pick func(sample.Sample) *float64) []point
 
-type levelVerdict struct{ steady bool; mean float64 }              // steady と fluctuating は CV で背反
+type levelVerdict struct{ steady bool; mean float64 }              // steady は水準系。fluctuating(変動系)とは独立に立ちうる(§8.3.1)
 // 向き(rising/falling/flat) と 変動(fluctuating) は独立に立つ（basic-spec §8.3.1）
 type dirVerdict struct{ dir dirKind; fluctuating bool; start, end, min, max float64 }
 // pinned と spike は排他・pinned 優先（basic-spec §8.3.1）。peakKind ∈ {none, pinned, spike}
@@ -495,7 +495,8 @@ func judgePeak(points []point, s stats, k seriesKind) peakVerdict // pinned 成�
 ```
 
 判定式は `basic-spec.md §8.3` の表そのまま。使用率系は pt、量的系列は平均比。決定性は入力統計量のみに依存（`basic-spec.md §8.4`）。回帰は各 `point.T`（実時刻）に対して行う。
-**複数成立の扱い（`basic-spec.md §8.3.1`）**: `judgeDirection` は向き（rising/falling/flat のいずれか1つ）と `fluctuating`（独立の bool）を両方返し、両立時は両方の文を出す（順序は 向き → 変動）。`judgePeak` は `pinned` を先に判定し、成立すれば `spike` は評価しない（全張り付き `[99,...]` が σ=0 で spike も満たす二重成立を防ぐ）。`steady` と `fluctuating` は変動係数の条件が背反なので同時には立たない。
+**複数成立の扱い（`basic-spec.md §8.3.1`）**: `judgeDirection` は向き（rising/falling/flat のいずれか1つ）と `fluctuating`（独立の bool）を両方返し、両立時は両方の文を出す（順序は 向き → 変動）。`judgePeak` は `pinned` を先に判定し、成立すれば `spike` は評価しない（pinned 優先）。**`steady`（`levelVerdict.steady`）と `fluctuating`（`dirVerdict.fluctuating`）は独立に立ちうる**（fluctuating は range 条件 `最大−最小≥40pt` でも成立するため、`CV<0.10` かつ大 range の系列で両方 true になりうる。`basic-spec.md §8.3.1` rev.3 訂正）。型は既に別フィールドなので両立を表現できる。
+**spike 判定（`basic-spec.md §8.3` rev.3）**: `judgePeak` の spike は **`max > mean + 2σ` かつ `max` が高位**で、かつ **`σ==0` なら spike=false**（定数系列 `[10,10,…]` の誤検出を防ぐ）。σ=0 判定は浮動小数の等値ではなく、標準偏差が実質ゼロ（例 `std < 極小ε`）で扱う（ゼロ除算・数値誤差の防御は実装詳細）。
 
 ### 7.3 分析
 
@@ -677,7 +678,8 @@ func sampler(ctx context.Context, coll collector.Collector, st *store.Store, int
 - **config（rev.2）**: 欠如/不正、そして **`interval=120, window 未指定/30` で実効ウィンドウ=120** になり最低1サンプルを保証すること。
 - **CPU トポロジ**: `logicalToSocket` の golden 入力でソケット集約、**取得不能時 `per_socket=[]`（空配列）フォールバック**、単一ソケットは `[overall]`（1要素）になること、初回CPU error で overall=nil の部分サンプルを保存すること。
 - **GPU パーサ/突合（golden file）**: `nvidia_smi.xml`、`system_profiler.json`、Windows PDH インスタンス名配列を固定。**同型NVIDIA2枚が nvidia-smi 単一ソースで正しく2枚に分かれること**、非NVIDIA が DXGI+PDH の LUID 突合で正しく結合すること、そして**条件付きソース選択の両分岐**——`nvidia-smi` 在時は NVIDIA が DXGI 列挙から除外され二重計上しないこと、`nvidia-smi` 不在時は NVIDIA が DXGI 列挙に含まれ CUDA=nil で返ること——を検証。
-- **傾向の複数成立（`basic-spec §8.3.1`）**: 乱高下しつつ +15pt 上昇する系列で fluctuating と rising が両方出ること、全張り付き `[99,99,99,99,99,99]` で pinned のみ（spike は出ない）になること、PDH engine `(LUID,phys,eng)` 集約で 3D 60%＋Copy 60% が adapterUtil=60 になること。
+- **傾向の複数成立（`basic-spec §8.3.1`）**: 乱高下しつつ +15pt 上昇する系列で fluctuating と rising が両方出ること、`CV<0.10` かつ range≥40pt の系列で steady と fluctuating が両方立つこと、全張り付き `[99,99,99,99,99,99]`（σ=0）で pinned のみ（spike は出ない）になること、PDH engine `(LUID,phys,eng)` 集約で 3D 60%＋Copy 60% が adapterUtil=60 になること。
+- **spike の定数系列非検出（`basic-spec §8.3` rev.3）**: `[10,10,10,10,10,10]`（σ=0）で spike が成立せず "spiked up to …" を出さないこと。`max > mean+2σ` の境界（σ>0 でちょうど等しいケースは spike にしない）も検証。
 - **PDH 使用率集約**: 3D 60%＋Copy 60% の入力で adapterUtil=60（max-engine、合算120や100clampでない）を検証。
 - **公開スキーマ**: `get_current_resources` の出力が `basic-spec §6.2`（`cpu`/`memory.used_percent`/`gpus` ネスト）に一致すること（スキーマ回帰テスト）。
 - **store**: 容量算出、上書き、`Snapshot` の window 絞り込み・昇順・複製独立性。
