@@ -190,7 +190,7 @@ const (
 )
 
 type GPUSample struct {
-    StableID     string  `json:"stable_id"`
+    StableID     string  `json:"stable_id"` // 同一プロセス実行中で安定（再起動をまたぐ永続性は非保証。§5.7）
     PCIBusID     *string `json:"pci_bus_id"`
     UUID         *string `json:"uuid"`
     OSAdapterID  *string `json:"os_adapter_id"`
@@ -313,7 +313,7 @@ result := append(nvGPUs, others...)           // どのGPUも単一ソース由�
 func parseNvidiaSmiXML(xmlBytes []byte) ([]sample.GPUSample, error) // golden XML でテスト（§12）
 ```
 
-`nvidia-smi` 不在（プローブ）なら NVIDIA 群は空。
+`nvidia-smi` 不在（プローブ）なら **nvidia-smi 由来の** NVIDIA 群は空になり、その場合 NVIDIA は §5.5 の DXGI＋PDH 側で列挙・使用率・VRAM を取得する（CUDA=nil。§5.4 の条件付きソース選択）。「NVIDIA が消える」わけではない。
 
 ### 5.5 Windows DXGI 列挙 ＋ PDH メトリクス層 — rev.3
 
@@ -330,18 +330,21 @@ func parseNvidiaSmiXML(xmlBytes []byte) ([]sample.GPUSample, error) // golden XM
 **PDH のサンプルライフサイクル（finding: PDH は2サンプル必要）**
 PDH の rate/timer 系カウンタは、formatted value を得るのに**前回値と現在値の2サンプル**が必要である（初回 `PdhCollectQueryData` は基準値のみ）。そこで **PDH クエリをコレクタの状態として保持**する。
 
+PDH は **query ハンドルと counter ハンドルが別**である。`PdhAddEnglishCounter` は **counter ハンドル（`PDH_HCOUNTER`）を返し**、`PdhGetFormattedCounterArray` が要求するのも **counter ハンドル**（query ハンドルではない）。`PdhCollectQueryData` は query ハンドルを取る。したがって両方を状態として保持する。
+
 ```
 probe/init 時:
-    h := PdhOpenQuery()
-    PdhAddEnglishCounter(h, `\GPU Engine(*)\Utilization Percentage`)   // English版でロケール非依存
-    PdhAddEnglishCounter(h, `\GPU Adapter Memory(*)\Dedicated Usage`)
-    PdhCollectQueryData(h)          // baseline（1回目）。値はまだ読まない
+    q := PdhOpenQuery()                                             // query ハンドル
+    hEngine := PdhAddEnglishCounter(q, `\GPU Engine(*)\Utilization Percentage`)  // counter ハンドル
+    hMemory := PdhAddEnglishCounter(q, `\GPU Adapter Memory(*)\Dedicated Usage`) // counter ハンドル
+    PdhCollectQueryData(q)          // baseline（1回目）。値はまだ読まない
 各 sampling tick（周期ごと）:
-    PdhCollectQueryData(h)          // 2回目以降
-    arr := PdhGetFormattedCounterArray(h, PDH_FMT_DOUBLE)
+    PdhCollectQueryData(q)                                   // query 単位で収集
+    engArr := PdhGetFormattedCounterArray(hEngine, PDH_FMT_DOUBLE)  // counter 単位で取得
+    memArr := PdhGetFormattedCounterArray(hMemory, PDH_FMT_DOUBLE)
 ```
 
-`windowsGPU` は `pdhQuery` ハンドルを保持し、`collect()` ごとに collect→format する。初回 tick は差がまだ整わない項目がありうるため N/A になりうる（FR-7/FR-9 と整合）。
+`windowsGPU` は query ハンドルと各 counter ハンドルを保持し、`collect()` ごとに collect→各 counter を format する。初回 tick は差がまだ整わない項目がありうるため N/A になりうる（FR-7/FR-9 と整合）。
 
 **使用率（PDH `GPU Engine`）— 最ビジーエンジン方式（finding #6 ＋ engine key 修正）**
 1. 上記クエリの `GPU Engine` インスタンス配列を得る。
@@ -354,8 +357,13 @@ probe/init 時:
 - **`IDXGIAdapter3::QueryVideoMemoryInfo().CurrentUsage` は呼び出しプロセス自身の使用量**のため VRAM 使用量には使わない（`basic-spec.md §7.4`）。
 
 ```go
-type windowsGPU struct { pdhQuery pdhHandle; nvSmiAvail bool /* ... */ }
-func (g *windowsGPU) probe(logger *slog.Logger)          // DXGI factory・PDH クエリ生成＋baseline collect・nvidia-smi 有無
+type windowsGPU struct {
+    pdhQuery     pdhQueryHandle    // PdhOpenQuery
+    engineCtr    pdhCounterHandle  // \GPU Engine(*)\Utilization Percentage
+    memoryCtr    pdhCounterHandle  // \GPU Adapter Memory(*)\Dedicated Usage
+    nvSmiAvail   bool
+}
+func (g *windowsGPU) probe(logger *slog.Logger)          // DXGI factory・PDH query生成＋counter追加＋baseline collect・nvidia-smi 有無
 func enumerateDXGINonNVIDIA() ([]sample.GPUSample, error) // NVIDIA 除外（nvidia-smi 在時）
 func enumerateDXGIAll() ([]sample.GPUSample, error)       // NVIDIA 含む（nvidia-smi 不在時、CUDA=nil）
 func (g *windowsGPU) queryUtilByLUID() (map[string]float64, error) // (LUID,phys,eng) 集約→max-engine
@@ -476,15 +484,18 @@ func computeStats(points []point) stats
 // 各系列は非nil値のみを (Timestamp, value) の point として抽出する。
 func series(samples []sample.Sample, pick func(sample.Sample) *float64) []point
 
-type levelVerdict struct{ steady bool; mean float64 }
-type dirVerdict   struct{ kind dirKind; start, end float64 }
-type peakVerdict  struct{ kind peakKind; max float64 }
+type levelVerdict struct{ steady bool; mean float64 }              // steady と fluctuating は CV で背反
+// 向き(rising/falling/flat) と 変動(fluctuating) は独立に立つ（basic-spec §8.3.1）
+type dirVerdict struct{ dir dirKind; fluctuating bool; start, end, min, max float64 }
+// pinned と spike は排他・pinned 優先（basic-spec §8.3.1）。peakKind ∈ {none, pinned, spike}
+type peakVerdict struct{ kind peakKind; max float64 }
 func judgeLevel(s stats) levelVerdict
-func judgeDirection(s stats, k seriesKind) dirVerdict
-func judgePeak(points []point, s stats, k seriesKind) peakVerdict
+func judgeDirection(s stats, k seriesKind) dirVerdict            // dir を1つに定め、fluctuating を独立に立てる
+func judgePeak(points []point, s stats, k seriesKind) peakVerdict // pinned 成立時は spike を判定しない
 ```
 
 判定式は `basic-spec.md §8.3` の表そのまま。使用率系は pt、量的系列は平均比。決定性は入力統計量のみに依存（`basic-spec.md §8.4`）。回帰は各 `point.T`（実時刻）に対して行う。
+**複数成立の扱い（`basic-spec.md §8.3.1`）**: `judgeDirection` は向き（rising/falling/flat のいずれか1つ）と `fluctuating`（独立の bool）を両方返し、両立時は両方の文を出す（順序は 向き → 変動）。`judgePeak` は `pinned` を先に判定し、成立すれば `spike` は評価しない（全張り付き `[99,...]` が σ=0 で spike も満たす二重成立を防ぐ）。`steady` と `fluctuating` は変動係数の条件が背反なので同時には立たない。
 
 ### 7.3 分析
 
@@ -653,7 +664,7 @@ func sampler(ctx context.Context, coll collector.Collector, st *store.Store, int
 ## 11. ロギングと異常系
 
 `slog` を `os.Stderr` に固定（`basic-spec.md §2.2, §11`）。レベル: 起動=Info、設定フォールバック/実効ウィンドウ引き上げ/採取部分失敗=Warn、パース詳細=Debug。
-`basic-spec.md §11` の事象表を分岐に対応（GPU非搭載=空配列、`nvidia-smi` 不在=NVIDIA群なし他OS継続、PDH/DXGI 不可=非NVIDIA使用率/VRAM を N/A、安定ID欠如=index+name＋warn、設定不正=既定へ、等）。
+`basic-spec.md §11` の事象表を分岐に対応（GPU非搭載=空配列、`nvidia-smi` 不在（Windows）=NVIDIA を DXGI+PDH で扱い CUDA のみ N/A、`nvidia-smi` 不在（Linux）=NVIDIA は sysfs 列挙のみ、PDH/DXGI 不可=使用率/VRAM を N/A、安定ID欠如=index+name＋warn、設定不正=既定へ、等）。
 
 ---
 
@@ -664,8 +675,9 @@ func sampler(ctx context.Context, coll collector.Collector, st *store.Store, int
 - **trend（最優先）**: テーブル駆動で固定サンプル→期待英語文。3系統・VRAM量的系列・データ不足・決定性（2回同一）。
 - **thresholds 境界**: CV 0.10/0.30、正味15pt、張り付き90%×95%、スパイク2σ。
 - **config（rev.2）**: 欠如/不正、そして **`interval=120, window 未指定/30` で実効ウィンドウ=120** になり最低1サンプルを保証すること。
-- **CPU トポロジ**: `logicalToSocket` の golden 入力でソケット集約、取得不能時 `per_socket=[overall]` フォールバック、初回CPU error で overall=nil の部分サンプルを保存すること。
-- **GPU パーサ/突合（golden file）**: `nvidia_smi.xml`、`system_profiler.json`、Windows PDH インスタンス名配列を固定。**同型NVIDIA2枚が nvidia-smi 単一ソースで正しく2枚に分かれること**、非NVIDIA が DXGI+PDH の LUID 突合で正しく結合すること、NVIDIA が DXGI 列挙から除外されること（二重計上なし）。
+- **CPU トポロジ**: `logicalToSocket` の golden 入力でソケット集約、**取得不能時 `per_socket=[]`（空配列）フォールバック**、単一ソケットは `[overall]`（1要素）になること、初回CPU error で overall=nil の部分サンプルを保存すること。
+- **GPU パーサ/突合（golden file）**: `nvidia_smi.xml`、`system_profiler.json`、Windows PDH インスタンス名配列を固定。**同型NVIDIA2枚が nvidia-smi 単一ソースで正しく2枚に分かれること**、非NVIDIA が DXGI+PDH の LUID 突合で正しく結合すること、そして**条件付きソース選択の両分岐**——`nvidia-smi` 在時は NVIDIA が DXGI 列挙から除外され二重計上しないこと、`nvidia-smi` 不在時は NVIDIA が DXGI 列挙に含まれ CUDA=nil で返ること——を検証。
+- **傾向の複数成立（`basic-spec §8.3.1`）**: 乱高下しつつ +15pt 上昇する系列で fluctuating と rising が両方出ること、全張り付き `[99,99,99,99,99,99]` で pinned のみ（spike は出ない）になること、PDH engine `(LUID,phys,eng)` 集約で 3D 60%＋Copy 60% が adapterUtil=60 になること。
 - **PDH 使用率集約**: 3D 60%＋Copy 60% の入力で adapterUtil=60（max-engine、合算120や100clampでない）を検証。
 - **公開スキーマ**: `get_current_resources` の出力が `basic-spec §6.2`（`cpu`/`memory.used_percent`/`gpus` ネスト）に一致すること（スキーマ回帰テスト）。
 - **store**: 容量算出、上書き、`Snapshot` の window 絞り込み・昇順・複製独立性。
